@@ -1,5 +1,5 @@
 import asyncio
-import os
+import re
 from pathlib import Path
 
 from agents.manager import Agent, AgentStatus, agent_manager
@@ -8,22 +8,28 @@ from config import settings
 
 
 COMPLETION_MARKER = "---CODEX-TASK-DONE---"
+ERROR_MARKER = "---CODEX-TASK-ERROR---"
 TAIL_LINES = 50
 
 
 async def run_task(agent: Agent, prompt: str) -> str:
+    from agents.watchdog import watchdog
+
     agent.status = AgentStatus.RUNNING
     agent.current_task = prompt
     agent.last_task = prompt
+    watchdog.touch(agent.name)
 
     # Clear the log file
     agent.log_path.write_text("")
 
-    # Build the codex command
+    # Build the codex command — capture exit code
     escaped_prompt = prompt.replace("'", "'\\''")
     command = (
         f"codex --full-auto '{escaped_prompt}' ; "
-        f"echo '{COMPLETION_MARKER}'"
+        f"EXIT_CODE=$? ; "
+        f"if [ $EXIT_CODE -eq 0 ]; then echo '{COMPLETION_MARKER}'; "
+        f"else echo '{ERROR_MARKER}'; fi"
     )
 
     await tmux.send_command(agent.name, command)
@@ -31,15 +37,19 @@ async def run_task(agent: Agent, prompt: str) -> str:
     # Wait for completion by tailing the log
     output = await _wait_for_completion(agent)
 
-    agent.status = AgentStatus.IDLE
+    if agent.status != AgentStatus.ERROR:
+        agent.status = AgentStatus.IDLE
     agent.current_task = None
 
     return output
 
 
 async def _wait_for_completion(agent: Agent, timeout: int = 600) -> str:
+    from agents.watchdog import watchdog
+
     elapsed = 0
     poll_interval = 2
+    last_size = 0
 
     while elapsed < timeout:
         await asyncio.sleep(poll_interval)
@@ -50,13 +60,22 @@ async def _wait_for_completion(agent: Agent, timeout: int = 600) -> str:
 
         content = agent.log_path.read_text(errors="replace")
 
+        # Update watchdog if new output appeared
+        if len(content) > last_size:
+            watchdog.touch(agent.name)
+            last_size = len(content)
+
         if COMPLETION_MARKER in content:
-            # Remove the marker and return clean output
             output = content.split(COMPLETION_MARKER)[0].strip()
             return _clean_output(output)
 
+        if ERROR_MARKER in content:
+            agent.status = AgentStatus.ERROR
+            output = content.split(ERROR_MARKER)[0].strip()
+            return _clean_output(output)
+
     agent.status = AgentStatus.ERROR
-    return "Task timed out after {timeout}s"
+    return f"Task timed out after {timeout}s"
 
 
 def _clean_output(raw: str) -> str:

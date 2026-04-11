@@ -5,8 +5,10 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from config import settings
-from agents.manager import agent_manager
+from agents.manager import agent_manager, AgentStatus
 from agents.runner import run_task, get_logs
+from agents.queue import queue_manager
+from agents.retry import run_with_retry
 
 
 def auth_required(func):
@@ -29,6 +31,10 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/agent list - List agents\n"
         "/agent delete <name> - Delete agent\n"
         "/run <agent> <task> - Run task\n"
+        "/continue <agent> - Re-run last task\n"
+        "/retry <agent> - Retry with auto-retry\n"
+        "/queue <agent> - Show task queue\n"
+        "/queue clear <agent> - Clear queue\n"
         "/status - Show status\n"
         "/logs <agent> - Show logs"
     )
@@ -102,9 +108,16 @@ async def run_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     agent = agent_manager.get_agent(agent_name)
 
     if agent.current_task:
+        # Agent is busy — queue the task
+        task_queue = queue_manager.get_or_create(agent)
+
+        async def notify(msg):
+            await update.message.reply_text(msg, parse_mode="Markdown")
+
+        task_queue.set_notify_callback(notify)
+        position = await task_queue.enqueue(task)
         await update.message.reply_text(
-            f"Agent '{agent_name}' is busy with: {agent.current_task}\n"
-            "Wait for it to finish or use /queue (Phase 2)."
+            f"Agent '{agent_name}' is busy. Task queued at position {position}."
         )
         return
 
@@ -112,7 +125,6 @@ async def run_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     output = await run_task(agent, task)
 
-    # Split long messages for Telegram's 4096 char limit
     for chunk in _split_message(output):
         await update.message.reply_text(f"```\n{chunk}\n```", parse_mode="Markdown")
 
@@ -150,6 +162,115 @@ async def logs_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for chunk in _split_message(logs):
         await update.message.reply_text(f"```\n{chunk}\n```", parse_mode="Markdown")
+
+
+@auth_required
+async def continue_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /continue <agent>")
+        return
+
+    agent_name = args[0]
+    if not agent_manager.has_agent(agent_name):
+        await update.message.reply_text(f"Agent '{agent_name}' not found.")
+        return
+
+    agent = agent_manager.get_agent(agent_name)
+
+    if not agent.last_task:
+        await update.message.reply_text(f"No previous task for '{agent_name}'.")
+        return
+
+    if agent.current_task:
+        await update.message.reply_text(f"Agent '{agent_name}' is already running.")
+        return
+
+    task = agent.last_task
+    await update.message.reply_text(f"Continuing on '{agent_name}': {task}")
+
+    output = await run_task(agent, task)
+
+    for chunk in _split_message(output):
+        await update.message.reply_text(f"```\n{chunk}\n```", parse_mode="Markdown")
+
+
+@auth_required
+async def retry_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /retry <agent>")
+        return
+
+    agent_name = args[0]
+    if not agent_manager.has_agent(agent_name):
+        await update.message.reply_text(f"Agent '{agent_name}' not found.")
+        return
+
+    agent = agent_manager.get_agent(agent_name)
+
+    if not agent.last_task:
+        await update.message.reply_text(f"No previous task for '{agent_name}'.")
+        return
+
+    if agent.current_task:
+        await update.message.reply_text(f"Agent '{agent_name}' is already running.")
+        return
+
+    task = agent.last_task
+    await update.message.reply_text(
+        f"Retrying on '{agent_name}' (max {3} attempts): {task}"
+    )
+
+    async def notify(msg):
+        await update.message.reply_text(msg)
+
+    output = await run_with_retry(agent, task, notify_callback=notify)
+
+    for chunk in _split_message(output):
+        await update.message.reply_text(f"```\n{chunk}\n```", parse_mode="Markdown")
+
+
+@auth_required
+async def queue_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /queue <agent> or /queue clear <agent>")
+        return
+
+    # /queue clear <agent>
+    if args[0].lower() == "clear":
+        if len(args) < 2:
+            await update.message.reply_text("Usage: /queue clear <agent>")
+            return
+        agent_name = args[1]
+        if not agent_manager.has_agent(agent_name):
+            await update.message.reply_text(f"Agent '{agent_name}' not found.")
+            return
+        agent = agent_manager.get_agent(agent_name)
+        task_queue = queue_manager.get_or_create(agent)
+        count = task_queue.clear()
+        await update.message.reply_text(f"Cleared {count} tasks from '{agent_name}' queue.")
+        return
+
+    # /queue <agent>
+    agent_name = args[0]
+    if not agent_manager.has_agent(agent_name):
+        await update.message.reply_text(f"Agent '{agent_name}' not found.")
+        return
+
+    agent = agent_manager.get_agent(agent_name)
+    task_queue = queue_manager.get_or_create(agent)
+    pending = task_queue.pending_tasks()
+
+    if not pending:
+        await update.message.reply_text(f"No pending tasks for '{agent_name}'.")
+        return
+
+    lines = [f"Queue for '{agent_name}' ({len(pending)} tasks):"]
+    for i, prompt in enumerate(pending, 1):
+        lines.append(f"  {i}. {prompt[:80]}")
+    await update.message.reply_text("\n".join(lines))
 
 
 def _split_message(text: str, max_len: int = 4000) -> list[str]:

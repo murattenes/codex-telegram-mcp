@@ -54,6 +54,13 @@ class AgentManager:
         await tmux.stop_pipe_pane(name)
         await tmux.kill_session(name)
         del self._agents[name]
+
+        # Clean up queue and watchdog references
+        from agents.queue import queue_manager
+        from agents.watchdog import watchdog
+        queue_manager.remove(name)
+        watchdog.remove(name)
+
         return True
 
     def get_agent(self, name: str) -> Agent:

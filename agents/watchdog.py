@@ -1,3 +1,5 @@
+"""Background watchdog that recovers hung or stale tmux-backed agents."""
+
 import asyncio
 import logging
 import time
@@ -13,31 +15,45 @@ CLEANUP_INTERVAL = 60    # check every 60s
 
 
 class Watchdog:
+    """Track agent activity and refresh broken or idle tmux sessions."""
+
     def __init__(self):
         self._last_output_times: dict[str, float] = {}
         self._task: asyncio.Task | None = None
         self._notify_callback = None
 
     def set_notify_callback(self, callback):
+        """Register a coroutine for watchdog-originated user notifications."""
+
         self._notify_callback = callback
 
     def start(self):
+        """Start the background watchdog loop once."""
+
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._run())
             logger.info("Watchdog started")
 
     def stop(self):
+        """Stop the background watchdog loop."""
+
         if self._task and not self._task.done():
             self._task.cancel()
             logger.info("Watchdog stopped")
 
     def touch(self, agent_name: str):
+        """Record that an agent produced output just now."""
+
         self._last_output_times[agent_name] = time.time()
 
     def remove(self, agent_name: str):
+        """Forget watchdog state for a deleted agent."""
+
         self._last_output_times.pop(agent_name, None)
 
     async def _run(self):
+        """Periodically inspect agents for hangs, crashes, and stale sessions."""
+
         while True:
             try:
                 await asyncio.sleep(CLEANUP_INTERVAL)
@@ -48,12 +64,13 @@ class Watchdog:
                 logger.error(f"Watchdog error: {e}")
 
     async def _check_agents(self):
+        """Apply timeout and health checks to every registered agent."""
+
         now = time.time()
 
         for agent in agent_manager.list_agents():
             last_output = self._last_output_times.get(agent.name, now)
 
-            # Check for hung running agents
             if agent.status == AgentStatus.RUNNING:
                 idle_duration = now - last_output
                 if idle_duration > IDLE_TIMEOUT:
@@ -63,14 +80,13 @@ class Watchdog:
                     await self._kill_hung_agent(agent)
                     continue
 
-            # Check for idle session cleanup
             if agent.status == AgentStatus.IDLE:
                 idle_duration = now - last_output
                 if idle_duration > SESSION_TTL:
                     logger.info(f"[{agent.name}] Idle for {idle_duration:.0f}s, cleaning up...")
                     await self._cleanup_idle_agent(agent)
 
-            # Check for crashed sessions (tmux dead but agent still registered)
+            # Detect broken tmux sessions so the bot does not report a false healthy state.
             if not await tmux.has_session(agent.name):
                 if agent.status == AgentStatus.RUNNING:
                     logger.warning(f"[{agent.name}] tmux session crashed")
@@ -82,6 +98,8 @@ class Watchdog:
                         )
 
     async def _kill_hung_agent(self, agent: Agent):
+        """Kill and recreate a stuck tmux session while preserving the agent record."""
+
         await tmux.kill_session(agent.name)
         agent.status = AgentStatus.ERROR
         task = agent.current_task
@@ -94,12 +112,13 @@ class Watchdog:
                 f"Use /retry {agent.name} to retry."
             )
 
-        # Recreate the tmux session so the agent is usable again
+        # Recreate the session immediately so the agent can accept the next command.
         await tmux.create_session(agent.name, agent.repo_path)
         await tmux.setup_pipe_pane(agent.name, agent.log_path)
 
     async def _cleanup_idle_agent(self, agent: Agent):
-        # Just refresh the session, don't delete the agent
+        """Refresh long-idle sessions without deleting the agent itself."""
+
         await tmux.kill_session(agent.name)
         await tmux.create_session(agent.name, agent.repo_path)
         await tmux.setup_pipe_pane(agent.name, agent.log_path)

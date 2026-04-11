@@ -1,3 +1,5 @@
+"""Telegram command handlers for agent lifecycle and task execution."""
+
 import functools
 from pathlib import Path
 
@@ -12,6 +14,8 @@ from agents.retry import run_with_retry
 
 
 def auth_required(func):
+    """Reject commands from users outside the configured allowlist."""
+
     @functools.wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
@@ -24,6 +28,8 @@ def auth_required(func):
 
 @auth_required
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send the command reference shown to authenticated users."""
+
     await update.message.reply_text(
         "Codex Agent Bot ready.\n\n"
         "Commands:\n"
@@ -42,6 +48,8 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @auth_required
 async def agent_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Create, list, or delete named agents."""
+
     args = context.args
     if not args:
         await update.message.reply_text("Usage: /agent <create|list|delete> [name]")
@@ -93,6 +101,8 @@ async def agent_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @auth_required
 async def run_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Run a task immediately or queue it if the agent is busy."""
+
     args = context.args
     if not args or len(args) < 2:
         await update.message.reply_text("Usage: /run <agent> <task description>")
@@ -108,7 +118,7 @@ async def run_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     agent = agent_manager.get_agent(agent_name)
 
     if agent.current_task:
-        # Agent is busy — queue the task
+        # Busy agents keep work in a per-agent FIFO queue instead of rejecting it.
         task_queue = queue_manager.get_or_create(agent)
 
         async def notify(msg):
@@ -131,6 +141,8 @@ async def run_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @auth_required
 async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Summarize the current state of all registered agents."""
+
     agents = agent_manager.list_agents()
     if not agents:
         await update.message.reply_text("No agents created.")
@@ -147,6 +159,8 @@ async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @auth_required
 async def logs_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Return the most recent captured log output for an agent."""
+
     args = context.args
     if not args:
         await update.message.reply_text("Usage: /logs <agent>")
@@ -166,6 +180,8 @@ async def logs_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @auth_required
 async def continue_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Re-run the last task sent to an agent."""
+
     args = context.args
     if not args:
         await update.message.reply_text("Usage: /continue <agent>")
@@ -197,6 +213,8 @@ async def continue_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @auth_required
 async def retry_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Retry the last task with exponential backoff on failure."""
+
     args = context.args
     if not args:
         await update.message.reply_text("Usage: /retry <agent>")
@@ -233,12 +251,14 @@ async def retry_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @auth_required
 async def queue_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show or clear an agent's pending task queue."""
+
     args = context.args
     if not args:
         await update.message.reply_text("Usage: /queue <agent> or /queue clear <agent>")
         return
 
-    # /queue clear <agent>
+    # Support both inspection and destructive clearing through one command.
     if args[0].lower() == "clear":
         if len(args) < 2:
             await update.message.reply_text("Usage: /queue clear <agent>")
@@ -253,7 +273,6 @@ async def queue_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Cleared {count} tasks from '{agent_name}' queue.")
         return
 
-    # /queue <agent>
     agent_name = args[0]
     if not agent_manager.has_agent(agent_name):
         await update.message.reply_text(f"Agent '{agent_name}' not found.")
@@ -274,6 +293,8 @@ async def queue_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _split_message(text: str, max_len: int = 4000) -> list[str]:
+    """Split long output into Telegram-safe message chunks."""
+
     if len(text) <= max_len:
         return [text]
     chunks = []

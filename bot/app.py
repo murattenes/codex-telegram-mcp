@@ -1,3 +1,5 @@
+"""Telegram bot application wiring and startup helpers."""
+
 import logging
 
 from telegram.ext import ApplicationBuilder, CommandHandler
@@ -19,6 +21,8 @@ logger = logging.getLogger(__name__)
 
 
 def create_bot():
+    """Build the Telegram application and register command handlers."""
+
     app = ApplicationBuilder().token(settings.telegram_bot_token).build()
 
     app.add_handler(CommandHandler("start", start_handler))
@@ -35,6 +39,8 @@ def create_bot():
 
 
 def run_bot():
+    """Start background services and begin Telegram long polling."""
+
     app = create_bot()
     watchdog.start()
     logger.info("Starting bot with long polling...")

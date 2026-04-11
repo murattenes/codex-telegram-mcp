@@ -1,3 +1,5 @@
+"""Retry helpers for rerunning failed Codex tasks with backoff."""
+
 import asyncio
 import logging
 
@@ -10,6 +12,8 @@ BASE_DELAY = 5  # seconds
 
 
 async def run_with_retry(agent: Agent, prompt: str, notify_callback=None) -> str:
+    """Retry a task until it succeeds or the retry budget is exhausted."""
+
     from agents.runner import run_task
 
     last_output = ""
@@ -22,6 +26,7 @@ async def run_with_retry(agent: Agent, prompt: str, notify_callback=None) -> str
             return output
 
         if attempt < MAX_RETRIES:
+            # Backoff reduces repeated failures from transient Codex or environment issues.
             delay = BASE_DELAY * (2 ** (attempt - 1))
             logger.warning(
                 f"[{agent.name}] Task failed (attempt {attempt}/{MAX_RETRIES}), "

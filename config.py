@@ -1,9 +1,14 @@
-from pydantic_settings import BaseSettings
-from pydantic import Field
+"""Centralized settings loaded from environment variables and defaults."""
+
 from pathlib import Path
+
+from pydantic import Field
+from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
+    """Runtime configuration for the bot and local agent sessions."""
+
     telegram_bot_token: str
     allowed_user_ids: list[int] = Field(default_factory=list)
     default_repo_path: Path = Path.home()
@@ -24,4 +29,5 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+# Ensure log output always has a writable destination.
 settings.log_dir.mkdir(exist_ok=True)

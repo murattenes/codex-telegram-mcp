@@ -1,10 +1,10 @@
+"""Task execution and log polling for Codex commands running in tmux."""
+
 import asyncio
 import re
-from pathlib import Path
 
-from agents.manager import Agent, AgentStatus, agent_manager
+from agents.manager import Agent, AgentStatus
 from tmux.controller import tmux
-from config import settings
 
 
 COMPLETION_MARKER = "---CODEX-TASK-DONE---"
@@ -13,6 +13,8 @@ TAIL_LINES = 50
 
 
 async def run_task(agent: Agent, prompt: str) -> str:
+    """Run a single Codex prompt inside the agent's tmux session."""
+
     from agents.watchdog import watchdog
 
     agent.status = AgentStatus.RUNNING
@@ -20,10 +22,10 @@ async def run_task(agent: Agent, prompt: str) -> str:
     agent.last_task = prompt
     watchdog.touch(agent.name)
 
-    # Clear the log file
+    # Reset the log so completion detection only sees output from this run.
     agent.log_path.write_text("")
 
-    # Build the codex command — capture exit code
+    # Emit explicit markers because tmux output alone does not provide structured status.
     escaped_prompt = prompt.replace("'", "'\\''")
     command = (
         f"codex --full-auto '{escaped_prompt}' ; "
@@ -34,7 +36,6 @@ async def run_task(agent: Agent, prompt: str) -> str:
 
     await tmux.send_command(agent.name, command)
 
-    # Wait for completion by tailing the log
     output = await _wait_for_completion(agent)
 
     if agent.status != AgentStatus.ERROR:
@@ -45,6 +46,8 @@ async def run_task(agent: Agent, prompt: str) -> str:
 
 
 async def _wait_for_completion(agent: Agent, timeout: int = 600) -> str:
+    """Poll the agent log until the task succeeds, fails, or times out."""
+
     from agents.watchdog import watchdog
 
     elapsed = 0
@@ -60,7 +63,7 @@ async def _wait_for_completion(agent: Agent, timeout: int = 600) -> str:
 
         content = agent.log_path.read_text(errors="replace")
 
-        # Update watchdog if new output appeared
+        # Fresh output means the session is still alive.
         if len(content) > last_size:
             watchdog.touch(agent.name)
             last_size = len(content)
@@ -79,12 +82,11 @@ async def _wait_for_completion(agent: Agent, timeout: int = 600) -> str:
 
 
 def _clean_output(raw: str) -> str:
-    # Remove ANSI escape codes
-    import re
+    """Remove terminal formatting noise and trim very long outputs."""
+
     ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
     cleaned = ansi_escape.sub('', raw)
 
-    # Trim to last N lines if too long
     lines = cleaned.strip().split('\n')
     if len(lines) > TAIL_LINES:
         lines = ["... (truncated) ..."] + lines[-TAIL_LINES:]
@@ -93,6 +95,8 @@ def _clean_output(raw: str) -> str:
 
 
 async def get_logs(agent: Agent, n_lines: int = 30) -> str:
+    """Return the most recent cleaned log lines for an agent."""
+
     if not agent.log_path.exists():
         return "No logs available."
 

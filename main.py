@@ -1,8 +1,11 @@
+"""Application entry point for the Telegram-driven Codex runner."""
+
 import logging
 import sys
 
 from dotenv import load_dotenv
 
+# Load environment variables before importing modules that read settings.
 load_dotenv()
 
 logging.basicConfig(

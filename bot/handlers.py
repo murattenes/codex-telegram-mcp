@@ -1,24 +1,46 @@
-"""Telegram command handlers for agent lifecycle and task execution."""
+"""Telegram command handlers for the chat-first hybrid bot."""
 
 import functools
 from pathlib import Path
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
-from config import settings
-from agents.manager import agent_manager, AgentStatus
-from agents.runner import run_task, get_logs
-from agents.queue import queue_manager
-from agents.retry import run_with_retry
-from git.operations import (
-    get_diff,
-    get_status,
-    commit as git_commit,
-    push as git_push,
-    get_current_branch,
+from agents.manager import AgentStatus, agent_manager
+from agents.runner import get_logs
+from bot.chat_state import chat_state
+from bot.confirmations import confirmations
+from bot.git_actions import (
+    describe_pr,
+    describe_push,
+    render_diff,
+    run_commit,
 )
-from git.pr import create_pr
+from config import settings
+from tmux.controller import tmux
+
+
+HELP_TEXT = (
+    "Codex Agent Bot\n\n"
+    "Plain text is forwarded to the active agent's Codex session.\n"
+    "Fast-paths (exact phrases):\n"
+    "  show me the diff\n"
+    "  commit it: <message>\n"
+    "  push it\n"
+    "  open a pr: <title>\n\n"
+    "Commands:\n"
+    "/new <name> [repo_path] - Create agent\n"
+    "/use <name> - Set active agent for this chat\n"
+    "/agents - List agents (tap to select)\n"
+    "/delete <name> - Delete agent\n"
+    "/status - Show all agents\n"
+    "/logs - Tail active agent log\n"
+    "/stop - Cancel running task on active agent\n"
+    "/diff - Git diff (active agent)\n"
+    "/commit <message> - Commit (active agent)\n"
+    "/push - Git push (active agent)\n"
+    "/pr <title> - Create PR (active agent)\n"
+)
 
 
 def auth_required(func):
@@ -34,390 +56,48 @@ def auth_required(func):
     return wrapper
 
 
-@auth_required
-async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send the command reference shown to authenticated users."""
+# -------------------- helpers --------------------
 
-    await update.message.reply_text(
-        "Codex Agent Bot ready.\n\n"
-        "Commands:\n"
-        "/agent create <name> - Create agent\n"
-        "/agent list - List agents\n"
-        "/agent delete <name> - Delete agent\n"
-        "/run <agent> <task> - Run task\n"
-        "/continue <agent> - Re-run last task\n"
-        "/retry <agent> - Retry with auto-retry\n"
-        "/queue <agent> - Show task queue\n"
-        "/queue clear <agent> - Clear queue\n"
-        "/diff <agent> - Show git diff\n"
-        "/commit <agent> <msg> - Commit changes\n"
-        "/push <agent> - Push current branch\n"
-        "/pr <agent> <title> - Create PR\n"
-        "/status - Show status\n"
-        "/logs <agent> - Show logs"
-    )
+def _resolve_active(chat_id: int):
+    """Return the active agent for a chat, falling back to lone-agent auto-select."""
+
+    name = chat_state.get_active(chat_id)
+    if name and agent_manager.has_agent(name):
+        return agent_manager.get_agent(name)
+
+    if name:
+        chat_state.clear_active(chat_id)
+
+    all_agents = agent_manager.list_agents()
+    if len(all_agents) == 1:
+        only = all_agents[0]
+        chat_state.set_active(chat_id, only.name)
+        return only
+    return None
 
 
-@auth_required
-async def agent_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Create, list, or delete named agents."""
+async def _require_active(update: Update):
+    """Ensure an active agent exists or explain how to set one."""
 
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /agent <create|list|delete> [name]")
-        return
+    agent = _resolve_active(update.effective_chat.id)
+    if agent is not None:
+        return agent
 
-    action = args[0].lower()
-
-    if action == "create":
-        if len(args) < 2:
-            await update.message.reply_text("Usage: /agent create <name> [repo_path]")
-            return
-        name = args[1]
-        repo_path = Path(args[2]) if len(args) > 2 else None
-        try:
-            agent = await agent_manager.create_agent(name, repo_path)
-            await update.message.reply_text(
-                f"Agent '{name}' created.\n"
-                f"Repo: {agent.repo_path}\n"
-                f"Status: {agent.status.value}"
-            )
-        except (ValueError, RuntimeError) as e:
-            await update.message.reply_text(f"Error: {e}")
-
-    elif action == "list":
-        agents = agent_manager.list_agents()
-        if not agents:
-            await update.message.reply_text("No agents.")
-            return
-        lines = []
-        for a in agents:
-            task_info = f" | Task: {a.current_task}" if a.current_task else ""
-            lines.append(f"- {a.name} [{a.status.value}]{task_info}")
-        await update.message.reply_text("\n".join(lines))
-
-    elif action == "delete":
-        if len(args) < 2:
-            await update.message.reply_text("Usage: /agent delete <name>")
-            return
-        name = args[1]
-        try:
-            await agent_manager.delete_agent(name)
-            await update.message.reply_text(f"Agent '{name}' deleted.")
-        except ValueError as e:
-            await update.message.reply_text(f"Error: {e}")
-
-    else:
-        await update.message.reply_text("Unknown action. Use: create, list, delete")
-
-
-@auth_required
-async def run_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Run a task immediately or queue it if the agent is busy."""
-
-    args = context.args
-    if not args or len(args) < 2:
-        await update.message.reply_text("Usage: /run <agent> <task description>")
-        return
-
-    agent_name = args[0]
-    task = " ".join(args[1:])
-
-    if not agent_manager.has_agent(agent_name):
-        await update.message.reply_text(f"Agent '{agent_name}' not found. Create it first.")
-        return
-
-    agent = agent_manager.get_agent(agent_name)
-
-    if agent.current_task:
-        # Busy agents keep work in a per-agent FIFO queue instead of rejecting it.
-        task_queue = queue_manager.get_or_create(agent)
-
-        async def notify(msg):
-            await update.message.reply_text(msg, parse_mode="Markdown")
-
-        task_queue.set_notify_callback(notify)
-        position = await task_queue.enqueue(task)
+    all_agents = agent_manager.list_agents()
+    if not all_agents:
         await update.message.reply_text(
-            f"Agent '{agent_name}' is busy. Task queued at position {position}."
+            "No agents yet. Create one with /new <name> [repo_path]."
         )
-        return
-
-    await update.message.reply_text(f"Running on '{agent_name}': {task}")
-
-    output = await run_task(agent, task)
-
-    for chunk in _split_message(output):
-        await update.message.reply_text(f"```\n{chunk}\n```", parse_mode="Markdown")
-
-
-@auth_required
-async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Summarize the current state of all registered agents."""
-
-    agents = agent_manager.list_agents()
-    if not agents:
-        await update.message.reply_text("No agents created.")
-        return
-
-    lines = ["Agent Status:"]
-    for a in agents:
-        icon = {"idle": "○", "running": "●", "error": "✗"}[a.status.value]
-        task_info = f"\n  Task: {a.current_task}" if a.current_task else ""
-        lines.append(f"{icon} {a.name} [{a.status.value}]{task_info}")
-
-    await update.message.reply_text("\n".join(lines))
-
-
-@auth_required
-async def logs_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Return the most recent captured log output for an agent."""
-
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /logs <agent>")
-        return
-
-    agent_name = args[0]
-    if not agent_manager.has_agent(agent_name):
-        await update.message.reply_text(f"Agent '{agent_name}' not found.")
-        return
-
-    agent = agent_manager.get_agent(agent_name)
-    logs = await get_logs(agent)
-
-    for chunk in _split_message(logs):
-        await update.message.reply_text(f"```\n{chunk}\n```", parse_mode="Markdown")
-
-
-@auth_required
-async def continue_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Re-run the last task sent to an agent."""
-
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /continue <agent>")
-        return
-
-    agent_name = args[0]
-    if not agent_manager.has_agent(agent_name):
-        await update.message.reply_text(f"Agent '{agent_name}' not found.")
-        return
-
-    agent = agent_manager.get_agent(agent_name)
-
-    if not agent.last_task:
-        await update.message.reply_text(f"No previous task for '{agent_name}'.")
-        return
-
-    if agent.current_task:
-        await update.message.reply_text(f"Agent '{agent_name}' is already running.")
-        return
-
-    task = agent.last_task
-    await update.message.reply_text(f"Continuing on '{agent_name}': {task}")
-
-    output = await run_task(agent, task)
-
-    for chunk in _split_message(output):
-        await update.message.reply_text(f"```\n{chunk}\n```", parse_mode="Markdown")
-
-
-@auth_required
-async def retry_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Retry the last task with exponential backoff on failure."""
-
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /retry <agent>")
-        return
-
-    agent_name = args[0]
-    if not agent_manager.has_agent(agent_name):
-        await update.message.reply_text(f"Agent '{agent_name}' not found.")
-        return
-
-    agent = agent_manager.get_agent(agent_name)
-
-    if not agent.last_task:
-        await update.message.reply_text(f"No previous task for '{agent_name}'.")
-        return
-
-    if agent.current_task:
-        await update.message.reply_text(f"Agent '{agent_name}' is already running.")
-        return
-
-    task = agent.last_task
-    await update.message.reply_text(
-        f"Retrying on '{agent_name}' (max {3} attempts): {task}"
-    )
-
-    async def notify(msg):
-        await update.message.reply_text(msg)
-
-    output = await run_with_retry(agent, task, notify_callback=notify)
-
-    for chunk in _split_message(output):
-        await update.message.reply_text(f"```\n{chunk}\n```", parse_mode="Markdown")
-
-
-@auth_required
-async def queue_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show or clear an agent's pending task queue."""
-
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /queue <agent> or /queue clear <agent>")
-        return
-
-    # Support both inspection and destructive clearing through one command.
-    if args[0].lower() == "clear":
-        if len(args) < 2:
-            await update.message.reply_text("Usage: /queue clear <agent>")
-            return
-        agent_name = args[1]
-        if not agent_manager.has_agent(agent_name):
-            await update.message.reply_text(f"Agent '{agent_name}' not found.")
-            return
-        agent = agent_manager.get_agent(agent_name)
-        task_queue = queue_manager.get_or_create(agent)
-        count = task_queue.clear()
-        await update.message.reply_text(f"Cleared {count} tasks from '{agent_name}' queue.")
-        return
-
-    agent_name = args[0]
-    if not agent_manager.has_agent(agent_name):
-        await update.message.reply_text(f"Agent '{agent_name}' not found.")
-        return
-
-    agent = agent_manager.get_agent(agent_name)
-    task_queue = queue_manager.get_or_create(agent)
-    pending = task_queue.pending_tasks()
-
-    if not pending:
-        await update.message.reply_text(f"No pending tasks for '{agent_name}'.")
-        return
-
-    lines = [f"Queue for '{agent_name}' ({len(pending)} tasks):"]
-    for i, prompt in enumerate(pending, 1):
-        lines.append(f"  {i}. {prompt[:80]}")
-    await update.message.reply_text("\n".join(lines))
-
-
-def _resolve_agent(update: Update, agent_name: str):
-    """Return the agent if it exists, otherwise None after replying with an error."""
-
-    if not agent_manager.has_agent(agent_name):
-        return None
-    return agent_manager.get_agent(agent_name)
-
-
-@auth_required
-async def diff_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show unstaged git diff for the agent's repo."""
-
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /diff <agent>")
-        return
-
-    agent = _resolve_agent(update, args[0])
-    if not agent:
-        await update.message.reply_text(f"Agent '{args[0]}' not found.")
-        return
-
-    status = await get_status(agent.repo_path)
-    diff = await get_diff(agent.repo_path)
-
-    if not diff.ok:
-        await update.message.reply_text(f"Error: {diff.stderr}")
-        return
-
-    if not diff.stdout.strip():
+    else:
+        names = ", ".join(a.name for a in all_agents)
         await update.message.reply_text(
-            f"No unstaged changes in '{agent.name}'.\n\nStatus:\n{status.stdout or '(clean)'}"
+            f"No active agent. Pick one with /use <name> or /agents. Available: {names}"
         )
-        return
-
-    header = f"Diff for '{agent.name}' ({agent.repo_path.name}):"
-    await update.message.reply_text(header)
-    for chunk in _split_message(diff.stdout):
-        await update.message.reply_text(f"```\n{chunk}\n```", parse_mode="Markdown")
+    return None
 
 
-@auth_required
-async def commit_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Stage everything and create a commit with the given message."""
-
-    args = context.args
-    if not args or len(args) < 2:
-        await update.message.reply_text('Usage: /commit <agent> <message>')
-        return
-
-    agent = _resolve_agent(update, args[0])
-    if not agent:
-        await update.message.reply_text(f"Agent '{args[0]}' not found.")
-        return
-
-    message = " ".join(args[1:]).strip('"').strip("'")
-    result = await git_commit(agent.repo_path, message)
-
-    if result.ok:
-        await update.message.reply_text(f"Committed on '{agent.name}':\n{result.stdout}")
-    else:
-        await update.message.reply_text(f"Commit failed:\n{result.output}")
-
-
-@auth_required
-async def push_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Push the agent's current branch to origin."""
-
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /push <agent>")
-        return
-
-    agent = _resolve_agent(update, args[0])
-    if not agent:
-        await update.message.reply_text(f"Agent '{args[0]}' not found.")
-        return
-
-    branch = await get_current_branch(agent.repo_path)
-    await update.message.reply_text(f"Pushing '{branch}' for '{agent.name}'...")
-
-    result = await git_push(agent.repo_path)
-    if result.ok:
-        await update.message.reply_text(f"Push ok:\n{result.stderr or result.stdout}")
-    else:
-        await update.message.reply_text(f"Push failed:\n{result.stderr}")
-
-
-@auth_required
-async def pr_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Commit, push, and open a pull request for the agent's repo."""
-
-    args = context.args
-    if not args or len(args) < 2:
-        await update.message.reply_text('Usage: /pr <agent> <title>')
-        return
-
-    agent = _resolve_agent(update, args[0])
-    if not agent:
-        await update.message.reply_text(f"Agent '{args[0]}' not found.")
-        return
-
-    title = " ".join(args[1:]).strip('"').strip("'")
-    await update.message.reply_text(f"Creating PR for '{agent.name}': {title}")
-
-    result = await create_pr(agent.repo_path, title)
-    if result.ok:
-        await update.message.reply_text(f"PR created: {result.url}")
-    else:
-        await update.message.reply_text(f"PR failed:\n{result.error}")
-
-
-def _split_message(text: str, max_len: int = 4000) -> list[str]:
-    """Split long output into Telegram-safe message chunks."""
+def _split_plain(text: str, max_len: int = 3500) -> list[str]:
+    """Split long text into Telegram-safe chunks."""
 
     if len(text) <= max_len:
         return [text]
@@ -426,3 +106,264 @@ def _split_message(text: str, max_len: int = 4000) -> list[str]:
         chunks.append(text[:max_len])
         text = text[max_len:]
     return chunks
+
+
+# -------------------- commands --------------------
+
+@auth_required
+async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Welcome message."""
+
+    await update.message.reply_text(HELP_TEXT)
+
+
+@auth_required
+async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Command reference."""
+
+    await update.message.reply_text(HELP_TEXT)
+
+
+@auth_required
+async def new_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Create a new agent and offer a quick-select button."""
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /new <name> [repo_path]")
+        return
+
+    name = args[0]
+    repo_path = Path(args[1]) if len(args) > 1 else None
+
+    try:
+        agent = await agent_manager.create_agent(name, repo_path)
+    except (ValueError, RuntimeError) as e:
+        await update.message.reply_text(f"Error: {e}")
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Use this agent", callback_data=f"use:{name}")]]
+    )
+    await update.message.reply_text(
+        f"Agent '{name}' created.\nRepo: {agent.repo_path}\nStatus: {agent.status.value}",
+        reply_markup=keyboard,
+    )
+
+
+@auth_required
+async def use_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set the active agent for this chat."""
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /use <name>")
+        return
+
+    name = args[0]
+    if not agent_manager.has_agent(name):
+        await update.message.reply_text(f"Agent '{name}' not found.")
+        return
+
+    chat_state.set_active(update.effective_chat.id, name)
+    await update.message.reply_text(f"Active agent set to '{name}'.")
+
+
+@auth_required
+async def agents_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List agents with inline select buttons."""
+
+    agents = agent_manager.list_agents()
+    if not agents:
+        await update.message.reply_text("No agents. Create one with /new <name>.")
+        return
+
+    active_name = chat_state.get_active(update.effective_chat.id)
+    buttons = []
+    for a in agents:
+        marker = " ✓" if a.name == active_name else ""
+        buttons.append(
+            [InlineKeyboardButton(f"{a.name}{marker}", callback_data=f"use:{a.name}")]
+        )
+
+    await update.message.reply_text(
+        "Agents (tap to select):",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+@auth_required
+async def delete_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Delete an agent and clear its active-agent pointers."""
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /delete <name>")
+        return
+
+    name = args[0]
+    try:
+        await agent_manager.delete_agent(name)
+    except ValueError as e:
+        await update.message.reply_text(f"Error: {e}")
+        return
+
+    chat_state.clear_agent_everywhere(name)
+    await update.message.reply_text(f"Agent '{name}' deleted.")
+
+
+@auth_required
+async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Summarize every agent and highlight the active one."""
+
+    agents = agent_manager.list_agents()
+    if not agents:
+        await update.message.reply_text("No agents.")
+        return
+
+    active_name = chat_state.get_active(update.effective_chat.id)
+    lines = ["Agents:"]
+    icons = {"idle": "○", "running": "●", "error": "✗"}
+    for a in agents:
+        marker = " ← active" if a.name == active_name else ""
+        task_info = f"\n    Task: {a.current_task}" if a.current_task else ""
+        lines.append(f"{icons[a.status.value]} {a.name} [{a.status.value}]{marker}{task_info}")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+@auth_required
+async def logs_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tail the active agent's log file."""
+
+    agent = await _require_active(update)
+    if agent is None:
+        return
+
+    logs = await get_logs(agent)
+    for chunk in _split_plain(logs):
+        await update.message.reply_text(f"```\n{chunk}\n```", parse_mode="Markdown")
+
+
+@auth_required
+async def stop_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send Ctrl-C to the active agent's tmux session."""
+
+    agent = await _require_active(update)
+    if agent is None:
+        return
+
+    if not agent.current_task:
+        await update.message.reply_text(f"Agent '{agent.name}' is not running anything.")
+        return
+
+    # C-c sends SIGINT to whatever Codex is doing in the pane.
+    await tmux.send_command(agent.name, "C-c")
+    agent.status = AgentStatus.ERROR
+    task = agent.current_task
+    agent.current_task = None
+    await update.message.reply_text(f"Stop signal sent to '{agent.name}'. Task was: {task}")
+
+
+# -------------------- git backup commands --------------------
+
+@auth_required
+async def diff_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Command backup for `show me the diff`."""
+
+    agent = await _require_active(update)
+    if agent is None:
+        return
+
+    messages = await render_diff(agent)
+    for msg in messages:
+        if msg.startswith("```"):
+            await update.message.reply_text(msg, parse_mode="Markdown")
+        else:
+            await update.message.reply_text(msg)
+
+
+@auth_required
+async def commit_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Command backup for `commit it: <msg>`."""
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /commit <message>")
+        return
+
+    agent = await _require_active(update)
+    if agent is None:
+        return
+
+    if agent.current_task:
+        await update.message.reply_text(
+            f"⚠️ Agent '{agent.name}' is busy. Try again when done."
+        )
+        return
+
+    message = " ".join(args).strip('"').strip("'")
+    result = await run_commit(agent, message)
+    await update.message.reply_text(result)
+
+
+@auth_required
+async def push_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Command backup for `push it` — posts inline confirmation."""
+
+    agent = await _require_active(update)
+    if agent is None:
+        return
+
+    if agent.current_task:
+        await update.message.reply_text(
+            f"⚠️ Agent '{agent.name}' is busy. Try again when done."
+        )
+        return
+
+    description = await describe_push(agent)
+    token = confirmations.create("push", agent.name, update.effective_chat.id)
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Confirm push", callback_data=f"confirm:{token}"),
+                InlineKeyboardButton("Cancel", callback_data=f"cancel:{token}"),
+            ]
+        ]
+    )
+    await update.message.reply_text(description, reply_markup=keyboard)
+
+
+@auth_required
+async def pr_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Command backup for `open a pr: <title>` — posts inline confirmation."""
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /pr <title>")
+        return
+
+    agent = await _require_active(update)
+    if agent is None:
+        return
+
+    if agent.current_task:
+        await update.message.reply_text(
+            f"⚠️ Agent '{agent.name}' is busy. Try again when done."
+        )
+        return
+
+    title = " ".join(args).strip('"').strip("'")
+    description = describe_pr(agent, title)
+    token = confirmations.create(
+        "pr", agent.name, update.effective_chat.id, payload=title
+    )
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Confirm PR", callback_data=f"confirm:{token}"),
+                InlineKeyboardButton("Cancel", callback_data=f"cancel:{token}"),
+            ]
+        ]
+    )
+    await update.message.reply_text(description, reply_markup=keyboard)

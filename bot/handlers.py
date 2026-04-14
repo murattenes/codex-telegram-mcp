@@ -11,6 +11,14 @@ from agents.manager import agent_manager, AgentStatus
 from agents.runner import run_task, get_logs
 from agents.queue import queue_manager
 from agents.retry import run_with_retry
+from git.operations import (
+    get_diff,
+    get_status,
+    commit as git_commit,
+    push as git_push,
+    get_current_branch,
+)
+from git.pr import create_pr
 
 
 def auth_required(func):
@@ -41,6 +49,10 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/retry <agent> - Retry with auto-retry\n"
         "/queue <agent> - Show task queue\n"
         "/queue clear <agent> - Clear queue\n"
+        "/diff <agent> - Show git diff\n"
+        "/commit <agent> <msg> - Commit changes\n"
+        "/push <agent> - Push current branch\n"
+        "/pr <agent> <title> - Create PR\n"
         "/status - Show status\n"
         "/logs <agent> - Show logs"
     )
@@ -290,6 +302,118 @@ async def queue_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i, prompt in enumerate(pending, 1):
         lines.append(f"  {i}. {prompt[:80]}")
     await update.message.reply_text("\n".join(lines))
+
+
+def _resolve_agent(update: Update, agent_name: str):
+    """Return the agent if it exists, otherwise None after replying with an error."""
+
+    if not agent_manager.has_agent(agent_name):
+        return None
+    return agent_manager.get_agent(agent_name)
+
+
+@auth_required
+async def diff_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show unstaged git diff for the agent's repo."""
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /diff <agent>")
+        return
+
+    agent = _resolve_agent(update, args[0])
+    if not agent:
+        await update.message.reply_text(f"Agent '{args[0]}' not found.")
+        return
+
+    status = await get_status(agent.repo_path)
+    diff = await get_diff(agent.repo_path)
+
+    if not diff.ok:
+        await update.message.reply_text(f"Error: {diff.stderr}")
+        return
+
+    if not diff.stdout.strip():
+        await update.message.reply_text(
+            f"No unstaged changes in '{agent.name}'.\n\nStatus:\n{status.stdout or '(clean)'}"
+        )
+        return
+
+    header = f"Diff for '{agent.name}' ({agent.repo_path.name}):"
+    await update.message.reply_text(header)
+    for chunk in _split_message(diff.stdout):
+        await update.message.reply_text(f"```\n{chunk}\n```", parse_mode="Markdown")
+
+
+@auth_required
+async def commit_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stage everything and create a commit with the given message."""
+
+    args = context.args
+    if not args or len(args) < 2:
+        await update.message.reply_text('Usage: /commit <agent> <message>')
+        return
+
+    agent = _resolve_agent(update, args[0])
+    if not agent:
+        await update.message.reply_text(f"Agent '{args[0]}' not found.")
+        return
+
+    message = " ".join(args[1:]).strip('"').strip("'")
+    result = await git_commit(agent.repo_path, message)
+
+    if result.ok:
+        await update.message.reply_text(f"Committed on '{agent.name}':\n{result.stdout}")
+    else:
+        await update.message.reply_text(f"Commit failed:\n{result.output}")
+
+
+@auth_required
+async def push_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Push the agent's current branch to origin."""
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /push <agent>")
+        return
+
+    agent = _resolve_agent(update, args[0])
+    if not agent:
+        await update.message.reply_text(f"Agent '{args[0]}' not found.")
+        return
+
+    branch = await get_current_branch(agent.repo_path)
+    await update.message.reply_text(f"Pushing '{branch}' for '{agent.name}'...")
+
+    result = await git_push(agent.repo_path)
+    if result.ok:
+        await update.message.reply_text(f"Push ok:\n{result.stderr or result.stdout}")
+    else:
+        await update.message.reply_text(f"Push failed:\n{result.stderr}")
+
+
+@auth_required
+async def pr_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commit, push, and open a pull request for the agent's repo."""
+
+    args = context.args
+    if not args or len(args) < 2:
+        await update.message.reply_text('Usage: /pr <agent> <title>')
+        return
+
+    agent = _resolve_agent(update, args[0])
+    if not agent:
+        await update.message.reply_text(f"Agent '{args[0]}' not found.")
+        return
+
+    title = " ".join(args[1:]).strip('"').strip("'")
+    await update.message.reply_text(f"Creating PR for '{agent.name}': {title}")
+
+    result = await create_pr(agent.repo_path, title)
+    if result.ok:
+        await update.message.reply_text(f"PR created: {result.url}")
+    else:
+        await update.message.reply_text(f"PR failed:\n{result.error}")
 
 
 def _split_message(text: str, max_len: int = 4000) -> list[str]:

@@ -9,6 +9,10 @@ from bot.handlers import (
     start_handler,
     agent_handler,
     run_handler,
+    diff_handler,
+    commit_handler,
+    push_handler,
+    pr_handler,
     continue_handler,
     retry_handler,
     queue_handler,
@@ -31,6 +35,10 @@ def create_bot():
     app.add_handler(CommandHandler("continue", continue_handler))
     app.add_handler(CommandHandler("retry", retry_handler))
     app.add_handler(CommandHandler("queue", queue_handler))
+    app.add_handler(CommandHandler("diff", diff_handler))
+    app.add_handler(CommandHandler("commit", commit_handler))
+    app.add_handler(CommandHandler("push", push_handler))
+    app.add_handler(CommandHandler("pr", pr_handler))
     app.add_handler(CommandHandler("status", status_handler))
     app.add_handler(CommandHandler("logs", logs_handler))
 

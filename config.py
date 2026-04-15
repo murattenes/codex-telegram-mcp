@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     allowed_user_ids: list[int] = Field(default_factory=list)
     default_repo_path: Path = Path.home()
     log_dir: Path = Path(__file__).parent / "logs"
+    state_dir: Path = Path(__file__).parent / "state"
 
     model_config = {
         "env_file": ".env",
@@ -29,5 +30,6 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
-# Ensure log output always has a writable destination.
+# Ensure log output and persisted state always have a writable destination.
 settings.log_dir.mkdir(exist_ok=True)
+settings.state_dir.mkdir(exist_ok=True)

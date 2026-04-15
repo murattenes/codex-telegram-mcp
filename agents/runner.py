@@ -14,7 +14,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from agents.manager import Agent, AgentStatus
+from agents.manager import Agent, AgentStatus, agent_manager
 from tmux.controller import tmux
 
 
@@ -75,6 +75,9 @@ async def run_task(agent: Agent, prompt: str) -> str:
         agent.turn_count += 1
         if result.usage:
             agent.last_usage = result.usage
+        # Persist turn_count / last_usage so the footer and continuity survive
+        # bot restarts. Cheap — the JSON file only holds a handful of agents.
+        agent_manager.save()
         footer = _format_usage_footer(result.usage, agent.turn_count)
         if footer:
             result.text = f"{result.text}\n\n{footer}"

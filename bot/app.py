@@ -10,6 +10,7 @@ from telegram.ext import (
     filters,
 )
 
+from agents.manager import agent_manager
 from agents.watchdog import watchdog
 from bot.handlers import (
     agents_handler,
@@ -41,6 +42,8 @@ callback_handler = auth_required(handle_callback)
 async def _post_init(app):
     """Start background tasks after python-telegram-bot creates the event loop."""
 
+    # Rebuild tmux state for any persisted agents before accepting updates.
+    await agent_manager.reconcile_with_tmux()
     watchdog.start()
 
 

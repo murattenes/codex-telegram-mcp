@@ -59,6 +59,7 @@ Nothing below the router changes. Runner, queue, retry, watchdog, git ops, PR he
 | `/status` | Summary of all agents + which is active in this chat |
 | `/logs` | Tail active agent's log |
 | `/stop` | Cancel currently running task on active agent |
+| `/reset` | Drop the active agent's Codex conversation; next turn starts a fresh session |
 | `/diff` | Git diff (backup for "show me the diff") |
 | `/commit <message>` | Commit (backup for "commit it: ...") |
 | `/push` | Git push (backup for "push it") |
@@ -215,7 +216,10 @@ No new fields on the `Agent` dataclass in v1.
 | `.gitignore` | Add `state/` |
 
 ### Unchanged
-`config.py`, `tmux/controller.py`, `agents/manager.py`, `agents/runner.py`, `agents/queue.py`, `agents/retry.py`, `agents/watchdog.py`, `git/operations.py`, `git/pr.py`
+`config.py`, `tmux/controller.py`, `agents/queue.py`, `agents/retry.py`, `agents/watchdog.py`, `git/operations.py`, `git/pr.py`
+
+### Runner continuity (landed pre-Phase B)
+`agents/runner.py` now uses `codex exec resume --last` so each agent carries a real conversational session across turns. Prompts are piped via stdin, output is parsed from `--json` events (`item.completed` / `turn.completed`), and `turn.completed.usage` is stored on the Agent for a token indicator in `/status`. On `resume` failure (no prior session, corrupted store, etc.) the runner auto-falls-back to a fresh `codex exec` and prefixes the reply with a notice. `/reset` sets `agent.reset_pending` which the runner consumes on the next turn to skip resume exactly once.
 
 ---
 

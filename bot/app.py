@@ -38,10 +38,28 @@ text_handler = auth_required(handle_text)
 callback_handler = auth_required(handle_callback)
 
 
+async def _post_init(app):
+    """Start background tasks after python-telegram-bot creates the event loop."""
+
+    watchdog.start()
+
+
+async def _post_shutdown(app):
+    """Stop background tasks during bot shutdown."""
+
+    watchdog.stop()
+
+
 def create_bot():
     """Build the Telegram application and register handlers."""
 
-    app = ApplicationBuilder().token(settings.telegram_bot_token).build()
+    app = (
+        ApplicationBuilder()
+        .token(settings.telegram_bot_token)
+        .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
+        .build()
+    )
 
     # Session / control commands
     app.add_handler(CommandHandler("start", start_handler))
@@ -76,6 +94,5 @@ def run_bot():
     """Start background services and begin Telegram long polling."""
 
     app = create_bot()
-    watchdog.start()
     logger.info("Starting bot with long polling...")
     app.run_polling(drop_pending_updates=True)

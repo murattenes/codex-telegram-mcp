@@ -25,6 +25,14 @@ class Agent:
     status: AgentStatus = AgentStatus.IDLE
     current_task: str | None = None
     last_task: str | None = None
+    # Set by /reset; consumed on the next run_task() call to skip `resume --last`
+    # and start a fresh Codex session instead.
+    reset_pending: bool = False
+    # Latest `turn.completed.usage` payload from Codex --json events. Used by
+    # /status to surface context size (input_tokens) as a token indicator.
+    last_usage: dict | None = None
+    # Count of successfully completed turns on this agent's current session.
+    turn_count: int = 0
 
     @property
     def log_path(self) -> Path:

@@ -48,6 +48,22 @@ The current code is a **working command-first bot**. It runs end-to-end but uses
 
 ---
 
+## Runner continuity fix (landed before v2 Phase B)
+
+`agents/runner.py` used to run every message as a fresh `codex exec`, so follow-up prompts with references like "it" or "that file" had no context. Fixed by switching to `codex exec resume --last` with stdin-piped prompts and `--json` event parsing:
+
+- First turn on an agent → `codex exec --full-auto --skip-git-repo-check --json -C <repo> -`
+- Subsequent turns → `codex exec resume --last ...` (same working directory, Codex picks up its own session store)
+- Reply text is built from `item.completed` `agent_message` items; completion is signalled by `turn.completed`; token usage is captured from `turn.completed.usage`
+- On resume failure (no prior session, bot restart edge cases, etc.) the runner auto-falls-back to a fresh `codex exec` and prefixes the reply with `ℹ️ Previous session unavailable, starting fresh.`
+- `Agent` gains `reset_pending`, `last_usage`, `turn_count` (all in-memory, no persistence changes)
+- `/reset` (to be wired up in v2 Phase B) sets `reset_pending` so the next turn skips resume
+- Auto-compaction is handled entirely by Codex itself — no special-case logic in the bot
+
+Probes confirmed: `resume --last` preserves context across turns (probe A), `--json` emits `turn.completed.usage` with `input_tokens` / `cached_input_tokens` / `output_tokens` (probe B), and the resume path rejects untrusted dirs unless `--skip-git-repo-check` is passed (probe C).
+
+---
+
 ## Pivot to v2: Chat-First Hybrid (CURRENT DIRECTION)
 
 User feedback: command-first UX is hostile on mobile. Redesigned around:

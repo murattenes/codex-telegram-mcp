@@ -21,6 +21,9 @@ from tmux.controller import tmux
 TAIL_LINES = 50
 DEFAULT_TIMEOUT = 600
 POLL_INTERVAL = 2
+# Assumed context window for the current Codex model. Used only to render a
+# "% of context used" footer on successful replies. Adjust if you switch models.
+CONTEXT_WINDOW_TOKENS = 400_000
 
 
 @dataclass
@@ -48,6 +51,11 @@ async def run_task(agent: Agent, prompt: str) -> str:
     use_resume = not agent.reset_pending
     agent.reset_pending = False
 
+    # Only turns after the first successful one should expect a prior session
+    # to exist. On turn 1 of a fresh agent, resume is guaranteed to fail, so
+    # we suppress the "Previous session unavailable" notice in that case.
+    had_prior_session = agent.turn_count > 0
+
     result = await _execute_turn(agent, prompt, resume=use_resume)
 
     # Broad fallback: if resume was attempted but Codex never produced a
@@ -56,15 +64,20 @@ async def run_task(agent: Agent, prompt: str) -> str:
     # resume failure we haven't enumerated yet.
     if use_resume and not result.saw_turn_completed and not result.ok:
         result = await _execute_turn(agent, prompt, resume=False)
-        result.text = (
-            "ℹ️ Previous session unavailable, starting fresh.\n\n" + result.text
-        )
+        if had_prior_session:
+            result.text = (
+                "ℹ️ Previous session unavailable, starting fresh.\n\n"
+                + result.text
+            )
 
     if result.ok:
         agent.status = AgentStatus.IDLE
         agent.turn_count += 1
         if result.usage:
             agent.last_usage = result.usage
+        footer = _format_usage_footer(result.usage, agent.turn_count)
+        if footer:
+            result.text = f"{result.text}\n\n{footer}"
     else:
         agent.status = AgentStatus.ERROR
 
@@ -84,12 +97,17 @@ async def _execute_turn(agent: Agent, prompt: str, resume: bool) -> TurnResult:
     prompt_file = Path(tempfile.gettempdir()) / f"codex-prompt-{turn_id}.txt"
     prompt_file.write_text(prompt)
 
+    # Exec-level flags must come BEFORE the `resume` sub-subcommand — clap
+    # parses parent-command options first, then dispatches to the subcommand.
+    # Putting them after `resume` causes Codex to reject `--json` etc. with
+    # "unexpected argument" and exit non-zero, which triggered the fallback
+    # on every turn and silently broke conversational continuity.
     base_flags = (
         f"--full-auto --skip-git-repo-check --json -C '{agent.repo_path}'"
     )
     if resume:
         codex_cmd = (
-            f"cat '{prompt_file}' | codex exec resume --last {base_flags} -"
+            f"cat '{prompt_file}' | codex exec {base_flags} resume --last -"
         )
     else:
         codex_cmd = f"cat '{prompt_file}' | codex exec {base_flags} -"
@@ -220,6 +238,30 @@ def _parse_json_stream(body: str) -> tuple[str, dict | None, bool]:
                 usage = raw_usage
 
     return "\n\n".join(messages).strip(), usage, saw_completed
+
+
+def _format_usage_footer(usage: dict | None, turn_count: int) -> str:
+    """Render a compact ``📊 NN.Nk / 400k (X%) · turn N`` footer for replies.
+
+    Uses ``input_tokens`` from Codex's ``turn.completed`` event as the running
+    context size. ``CONTEXT_WINDOW_TOKENS`` is a static assumption — adjust it
+    if you switch to a model with a different context window.
+    """
+
+    if not isinstance(usage, dict):
+        return f"📊 turn {turn_count}"
+
+    input_tokens = usage.get("input_tokens")
+    if not isinstance(input_tokens, int):
+        return f"📊 turn {turn_count}"
+
+    used_k = input_tokens / 1000
+    window_k = CONTEXT_WINDOW_TOKENS / 1000
+    percent = (input_tokens / CONTEXT_WINDOW_TOKENS) * 100
+
+    return (
+        f"📊 {used_k:.1f}k / {window_k:.0f}k ({percent:.1f}%) · turn {turn_count}"
+    )
 
 
 def _trim_tail(text: str) -> str:
